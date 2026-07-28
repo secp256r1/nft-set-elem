@@ -6,8 +6,8 @@ description = "List, add, delete, and replace nftables set elements over nfnetli
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "time", "macros"] }
-clap = { version = "4", features = ["derive"], optional = true }
+tokio = { version = "1.53.1", features = ["rt", "time", "macros"] }
+clap = { version = "4.6.4", features = ["derive"], optional = true }
 
 [features]
 default = []
