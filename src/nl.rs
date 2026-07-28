@@ -505,9 +505,7 @@ pub fn set_contains_ip(elems: &[Elem], is_interval: bool, ip_bytes: &[u8]) -> bo
     // ── Step 1: normalise elements carrying KEY_END ──
     let mut stream: Vec<Elem> = Vec::with_capacity(elems.len() * 2);
     for e in elems {
-        if e.is_end {
-            stream.push(e.clone());
-        } else if e.key_end.is_empty() {
+        if e.is_end || e.key_end.is_empty() {
             stream.push(e.clone());
         } else {
             // Split (key + key_end) into a normal start and an end-marker.
@@ -530,10 +528,9 @@ pub fn set_contains_ip(elems: &[Elem], is_interval: bool, ip_bytes: &[u8]) -> bo
     let mut pending_start: Option<Vec<u8>> = None;
     for e in &stream {
         if e.is_end {
-            if let Some(start) = pending_start.take() {
-                if ip_bytes >= start.as_slice() && ip_bytes < e.key.as_slice() {
-                    return true;
-                }
+            if let Some(start) = pending_start.take()
+                && ip_bytes >= start.as_slice() && ip_bytes < e.key.as_slice() {
+                return true;
             }
         } else if let Some(start) = &pending_start {
             // Consecutive starts without intervening end: prev is single.
@@ -545,10 +542,8 @@ pub fn set_contains_ip(elems: &[Elem], is_interval: bool, ip_bytes: &[u8]) -> bo
             pending_start = Some(e.key.clone());
         }
     }
-    if let Some(start) = &pending_start {
-        if ip_bytes == start.as_slice() {
-            return true;
-        }
+    if let Some(start) = &pending_start && ip_bytes == start.as_slice() {
+        return true;
     }
     false
 }
@@ -1171,7 +1166,7 @@ pub async fn set_contains_ip_async(
 /// expands into (start, end-marker) pairs via `increment_be`, mirroring
 /// what `nft` would send for a standalone add / delete.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub async fn batch_add_and_delete_set_element(
     family: u8,
     table: &str,
@@ -1260,7 +1255,6 @@ pub async fn batch_add_and_delete_set_element(
 /// Helper to serialise one element (or start+end pair for interval sets)
 /// into the currently-open `NFTA_SET_ELEM_LIST_ELEMENTS` nest.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 fn put_elem_into_list(
     buf: &mut MsgBuf,
     is_interval: bool,
@@ -1298,6 +1292,113 @@ fn put_elem_into_list(
     } else {
         put_one(key, false, timeout_ms);
     }
+}
+
+// ---------------------------------------------------------------------------
+// batch-add-multiple elements  (Linux only)
+// ---------------------------------------------------------------------------
+
+/// Descriptor for one element to be added in a batch.
+pub struct AddElem<'a> {
+    /// Raw key bytes (network order).
+    pub key: &'a [u8],
+    /// Inclusive upper bound (e.g. broadcast). For interval sets the
+    /// exclusive-end marker is auto-computed by incrementing this value.
+    /// Non-interval sets ignore this field.
+    pub key_end: Option<&'a [u8]>,
+    /// Element-wide timeout (u64 ms). `None` = no timeout.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Batch-add multiple elements to an nftables set in a single atomic
+/// nfnetlink batch transaction.
+///
+/// All elements are added inside one `NFNL_MSG_BATCH_BEGIN` … `BATCH_END`
+/// boundary, so either every element is committed or none are.
+///
+/// `dump_set_flags` is called once to detect interval semantics and
+/// the result applies to every element in the batch.  Each element
+/// independently goes through the same expansion as [`add_set_element`]:
+/// interval-set elements are sent as (start, end-marker) pairs.
+///
+/// `excl` controls whether `NLM_F_EXCL` is set (fail on duplicate).
+/// When `excl` is `true`, *any* duplicate element causes the entire
+/// batch to fail.
+#[cfg(target_os = "linux")]
+pub async fn batch_add_set_elements(
+    family: u8,
+    table: &str,
+    set: &str,
+    elements: &[AddElem<'_>],
+    excl: bool,
+) -> io::Result<()> {
+    // One flags query for the whole batch.
+    let is_interval = match dump_set_flags(family, table, set).await {
+        Ok(f) => (f & NFT_SET_INTERVAL) != 0,
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("cannot query set flags: {e}"),
+            ));
+        }
+    };
+
+    let nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM;
+    let mut extra = NLM_F_CREATE;
+    if excl { extra |= NLM_F_EXCL; }
+    let flags = NLM_F_REQUEST | extra | NLM_F_ACK;
+
+    let mut buf = MsgBuf::new();
+    let base_seq = std::process::id();
+
+    // ── BATCH_BEGIN ──
+    {
+        let off = buf.put_header();
+        buf.set_header(
+            off, NFNL_MSG_BATCH_BEGIN, AF_UNSPEC,
+            base_seq, NLM_F_REQUEST, NFNL_SUBSYS_NFTABLES,
+        );
+    }
+
+    // ── one NEWSETELEM per element ──
+    let elem_seqs: Vec<u32> = (0..elements.len() as u32)
+        .map(|i| base_seq + 1 + i)
+        .collect();
+    let mut elem_offs: Vec<usize> = Vec::with_capacity(elements.len());
+
+    for (i, elem) in elements.iter().enumerate() {
+        let elem_off = buf.put_header();
+        buf.put_attr_stringz(NFTA_SET_ELEM_LIST_TABLE, table);
+        buf.put_attr_stringz(NFTA_SET_ELEM_LIST_SET, set);
+
+        {
+            let nest_list = buf.open_nest(NFTA_SET_ELEM_LIST_ELEMENTS);
+            put_elem_into_list(&mut buf, is_interval, elem.key, elem.key_end, elem.timeout_ms);
+            buf.close_nest(nest_list);
+        }
+
+        buf.set_header(elem_off, nlmsg_type, family, elem_seqs[i], flags, 0);
+        elem_offs.push(elem_off);
+    }
+
+    // ── BATCH_END ──
+    {
+        let off = buf.put_header();
+        buf.set_header(
+            off, NFNL_MSG_BATCH_END, AF_UNSPEC,
+            base_seq + elements.len() as u32 + 1, NLM_F_REQUEST, NFNL_SUBSYS_NFTABLES,
+        );
+    }
+
+    // ── Transport ──
+    let sess = NlSession::open().await?;
+    for (&off, &seq) in elem_offs.iter().zip(elem_seqs.iter()) {
+        buf.fix_seq_at(off, seq);
+    }
+    sess.send(&buf).await?;
+
+    sess.recv_for_seqs(&elem_seqs, |_nlmsg_type, _body| Ok(())).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,6 +1454,7 @@ pub async fn delete_set_element(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 pub async fn batch_add_and_delete_set_element(
     _family: u8,
     _table: &str,
@@ -1367,6 +1469,20 @@ pub async fn batch_add_and_delete_set_element(
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "nfnetlink batch add+delete is only supported on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn batch_add_set_elements(
+    _family: u8,
+    _table: &str,
+    _set: &str,
+    _elements: &[AddElem<'_>],
+    _excl: bool,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nfnetlink batch-add elements is only supported on Linux",
     ))
 }
 
