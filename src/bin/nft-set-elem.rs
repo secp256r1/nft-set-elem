@@ -95,6 +95,9 @@ fn is_family(s: &str) -> bool {
     matches!(s, "ip" | "ip6" | "inet" | "bridge" | "arp" | "netdev")
 }
 
+// clap value_parser wrappers around fmt::{parse_duration,parse_element}.
+// The wrappers convert the library's Option return into clap's Result,
+// adding a user-facing error hint on parse failure.
 fn parse_duration(s: &str) -> Result<u64, String> {
     fmt::parse_duration(s).ok_or_else(|| {
         format!("cannot parse duration '{s}' (expected format like 30s, 5m, 1h30m, 250ms)")

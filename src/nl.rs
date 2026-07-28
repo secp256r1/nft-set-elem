@@ -37,8 +37,6 @@ const NLM_F_ACK:     u16 = 0x04;
 const NLMSG_NOOP:  u16 = 0x1;
 const NLMSG_ERROR: u16 = 0x2;
 const NLMSG_DONE:  u16 = 0x3;
-#[allow(dead_code)]
-const NLMSG_MIN_TYPE: u16 = 0x10;
 
 // nla_type flags
 const NLA_F_NESTED:       u16 = 1 << 15;
@@ -86,7 +84,7 @@ const NFTA_SET_ELEM_LIST_ELEMENTS: u16 = 3;
 // NFTA_LIST_ELEM (1) wraps each element inside NFTA_SET_ELEM_LIST_ELEMENTS.
 const NFTA_LIST_ELEM: u16 = 1;
 
-// NFTA_SET_ELEM_* attributes
+// NFTA_SET_ELEM_* attributes  (values from the kernel's nft_set_elem_attr enum)
 const NFTA_SET_ELEM_KEY:         u16 = 1;
 const NFTA_SET_ELEM_FLAGS:       u16 = 3;
 const NFTA_SET_ELEM_TIMEOUT:     u16 = 4;
@@ -224,7 +222,6 @@ impl MsgBuf {
     }
 
     /// Open a nested attribute (returns an anchor used by close_nest()).
-    #[allow(dead_code)]
     fn open_nest(&mut self, t: u16) -> usize {
         let hdr_off = self.buf.len();
         let nla_type = t | NLA_F_NESTED;
@@ -235,7 +232,6 @@ impl MsgBuf {
     }
 
     /// Close a nested attribute, back-patching its length.
-    #[allow(dead_code)]
     fn close_nest(&mut self, anchor: usize) {
         let total = (self.buf.len() - anchor) as u16;
         self.buf[anchor..anchor + 2].copy_from_slice(&total.to_ne_bytes());
@@ -253,8 +249,6 @@ struct NlAttr<'a> { raw_type: u16, payload: &'a [u8] }
 
 impl<'a> NlAttr<'a> {
     fn attr_type(&self) -> u16 { self.raw_type & NLA_TYPE_MASK }
-    #[allow(dead_code)]
-    fn len(&self) -> usize { self.payload.len() }
     /// Network-byte-order u32 (libnftnl stores scalars with htonl on the wire).
     fn as_u32_be(&self) -> u32 {
         let mut b = [0u8; 4];
@@ -360,6 +354,9 @@ impl<'a> Table<'a> {
     fn new<I: IntoIterator<Item = NlAttr<'a>>>(attrs: I) -> Self {
         Table { items: attrs.into_iter().map(|a| (a.attr_type(), a)).collect() }
     }
+    /// Look up by attribute type.  Uses `rev().find()` so that if the
+    /// kernel (erroneously) duplicates an attribute, the **last** one
+    /// wins — consistent with last-value-wins semantics elsewhere.
     fn get(&self, t: u16) -> Option<&NlAttr<'a>> {
         self.items.iter().rev().find(|(k, _)| *k == t).map(|(_, v)| v)
     }
@@ -449,11 +446,13 @@ pub fn reduce_intervals(elems: Vec<Elem>, is_interval: bool) -> Vec<Elem> {
                 if let Some(x) = e.timeout_ms    { merged.timeout_ms.get_or_insert(x); }
                 // Decrement the exclusive end by 1 to get the inclusive
                 // upper bound.  If this underflows (end == 0, shouldn't
-                // happen in a valid interval set) leave as-is.
+                // happen in a valid interval set) skip the orphan pair.
                 let mut end_incl = e.key.clone();
-                decrement_be(&mut end_incl);
-                merged.key_end = end_incl;
-                out.push(merged);
+                if decrement_be(&mut end_incl).is_some() {
+                    merged.key_end = end_incl;
+                    out.push(merged);
+                }
+                // else: underflow — drop the orphan pair.
             } else {
                 // Orphan end marker (no preceding start) — silently drop
                 // it, matching nftables segtree.c lines 649-654 where
@@ -464,11 +463,32 @@ pub fn reduce_intervals(elems: Vec<Elem>, is_interval: bool) -> Vec<Elem> {
             }
         } else {
             if let Some(prev) = pending.take() {
-                // Consecutive starts without an intermediate end: emit prev
-                // as a single address, then begin a new pending pair.
-                out.push(prev);
+                // Consecutive starts without an intermediate end.
+                // Check if they form a valid interval pair (prev=start, e=exclusive end).
+                // This handles kernels that omit the INTERVAL_END flag on the end boundary.
+                // The kernel sends EXCLUSIVE end, so we must decrement to get inclusive end
+                // before checking if they form a valid CIDR.
+                let mut end_incl = e.key.clone();
+                if decrement_be(&mut end_incl).is_some()
+                    && crate::fmt::interval_to_cidr(&prev.key, &end_incl).is_some()
+                {
+                    // They form a valid CIDR range: prev is start, e is exclusive end.
+                    let mut merged = prev.clone();
+                    // Carry timeout/expiration from either side.
+                    if let Some(x) = e.expiration_ms { merged.expiration_ms.get_or_insert(x); }
+                    if let Some(x) = e.timeout_ms    { merged.timeout_ms.get_or_insert(x); }
+                    merged.key_end = end_incl;
+                    out.push(merged);
+                    // Clear pending since we consumed both elements.
+                    pending = None;
+                } else {
+                    // Not a valid interval pair: emit prev as single, keep e as pending.
+                    out.push(prev);
+                    pending = Some(e);
+                }
+            } else {
+                pending = Some(e);
             }
-            pending = Some(e);
         }
     }
     if let Some(last) = pending {
@@ -496,7 +516,6 @@ pub fn reduce_intervals(elems: Vec<Elem>, is_interval: bool) -> Vec<Elem> {
 /// are sorted by key, start/end pairs are formed, and membership is checked
 /// against the half-open interval `[start, end_exclusive)`.  Non-interval
 /// sets use exact `key` matching.
-#[allow(dead_code)]
 pub fn set_contains_ip(elems: &[Elem], is_interval: bool, ip_bytes: &[u8]) -> bool {
     if !is_interval {
         return elems.iter().any(|e| !e.is_end && ip_bytes == e.key.as_slice());
@@ -525,7 +544,13 @@ pub fn set_contains_ip(elems: &[Elem], is_interval: bool, ip_bytes: &[u8]) -> bo
     stream.sort_by(|a, b| a.key.cmp(&b.key));
 
     // ── Step 3: walk the stream, check each pair for containment ──
+    // Collect standalone singles (consecutive starts without an intervening
+    // end) and check them in a final pass — this ensures we don't drop a
+    // start when the next element is also a start rather than an end.
+    // Also detect valid interval pairs where the kernel omits INTERVAL_END
+    // on the end boundary.
     let mut pending_start: Option<Vec<u8>> = None;
+    let mut singles: Vec<Vec<u8>> = Vec::new();
     for e in &stream {
         if e.is_end {
             if let Some(start) = pending_start.take()
@@ -533,45 +558,82 @@ pub fn set_contains_ip(elems: &[Elem], is_interval: bool, ip_bytes: &[u8]) -> bo
                 return true;
             }
         } else if let Some(start) = &pending_start {
-            // Consecutive starts without intervening end: prev is single.
-            if ip_bytes == start.as_slice() {
-                return true;
+            // Consecutive starts without an intervening end.
+            // Check if they form a valid interval pair (start, exclusive end).
+            // The kernel sends EXCLUSIVE end, so we must decrement to get
+            // the inclusive upper bound before checking CIDR validity.
+            let mut end_incl = e.key.clone();
+            if decrement_be(&mut end_incl).is_some()
+                && crate::fmt::interval_to_cidr(start, &end_incl).is_some()
+            {
+                // They form a valid CIDR range: start is inclusive start, e.key is exclusive end.
+                if ip_bytes >= start.as_slice() && ip_bytes < e.key.as_slice() {
+                    return true;
+                }
+                // Not in this range, clear pending and continue.
+                pending_start = None;
+            } else {
+                // Not a valid interval pair: the previous start is a standalone single.
+                singles.push(start.clone());
+                pending_start = Some(e.key.clone());
             }
-            pending_start = Some(e.key.clone());
         } else {
             pending_start = Some(e.key.clone());
         }
     }
+    // Check the last pending start (if any) as a standalone.
     if let Some(start) = &pending_start && ip_bytes == start.as_slice() {
         return true;
+    }
+    // Final pass: check all accumulated standalone singles.
+    for s in &singles {
+        if ip_bytes == s.as_slice() {
+            return true;
+        }
     }
     false
 }
 
 /// Increment a big-endian (network-order) byte string by 1 in place,
 /// propagating carries from the least-significant byte (the last one) up.
-/// Returns `None` on overflow (all-0xFF bytes).
+/// Returns `None` on overflow (all-0xFF bytes).  On overflow the buffer
+/// is left **unchanged**.
 fn increment_be(b: &mut [u8]) -> Option<()> {
-    for i in (0..b.len()).rev() {
-        match b[i] {
-            0xff => b[i] = 0x00,            // carry
-            n    => { b[i] = n + 1; return Some(()); }
-        }
+    // Fast path: if every byte is already 0xff, overflow immediately.
+    if b.iter().all(|&x| x == 0xff) {
+        return None;
     }
-    None // overflow
+    for i in (0..b.len()).rev() {
+        if b[i] != 0xff {
+            b[i] += 1;
+            return Some(());
+        }
+        b[i] = 0x00;  // carry to the next more-significant byte
+    }
+    None
 }
 
 /// Decrement a big-endian (network-order) byte string by 1 in place, doing
 /// a borrow chain from the least-significant byte (the last one) up.
-fn decrement_be(b: &mut [u8]) {
-    if b.is_empty() { return; }
-    // Walk from the LSB (last byte) toward the MSB, borrowing on underflow.
-    for i in (0..b.len()).rev() {
-        match b[i] {
-            0    => b[i] = 0xff,         // borrow: this byte becomes 0xff, propagate
-            n    => { b[i] = n - 1; return; }
-        }
+/// Returns `None` on underflow (all-0x00 bytes — should not happen in a
+/// valid interval set, but handled defensively).  On underflow the buffer
+/// is left **unchanged**.
+fn decrement_be(b: &mut [u8]) -> Option<()> {
+    if b.is_empty() { return None; }
+    // Fast path: if every byte is already zero, underflow immediately
+    // without modifying the buffer.
+    if b.iter().all(|&x| x == 0) {
+        return None;
     }
+    for i in (0..b.len()).rev() {
+        if b[i] != 0 {
+            b[i] -= 1;
+            return Some(());
+        }
+        b[i] = 0xff;  // borrow from the next more-significant byte
+    }
+    // We checked all-zero above, so this is unreachable.
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -651,15 +713,16 @@ impl NlSession {
                 }
             })??;
 
-            // If recv reported truncation, retry with a bigger buffer.
+            // If recv_from truncated the message (msg_len == recv.capacity()
+            // and the kernel indicates more data was available), grow and
+            // retry once.  Note: `n == recv.capacity()` is a heuristic — it
+            // may also occur when the message exactly fills the buffer, but
+            // retrying once with a larger buffer is harmless.
             let n = recv.len();
-            if n as u32 == u32::MAX || (n == recv.capacity() && n < 256 * 1024) {
-                // Possible truncation — grow and retry once.
-                if recv.capacity() < 256 * 1024 {
-                    let cap = (recv.capacity() * 2).min(256 * 1024);
-                    recv = BytesMut::with_capacity(cap);
-                    continue;
-                }
+            if n == recv.capacity() && n < 256 * 1024 && n > 0 {
+                let cap = (recv.capacity() * 2).min(256 * 1024);
+                recv = BytesMut::with_capacity(cap);
+                continue;
             }
             if n == 0 {
                 break;
@@ -724,7 +787,6 @@ impl NlSession {
         Ok(())
     }
 
-    #[allow(dead_code)]
     /// Like [`recv_each`] but accepts any of the given sequence numbers.
     /// Used for batch operations where multiple messages (each with
     /// a different seq) share one socket and we must verify all of them.
@@ -746,12 +808,10 @@ impl NlSession {
             })??;
 
             let n = recv.len();
-            if n as u32 == u32::MAX || (n == recv.capacity() && n < 256 * 1024) {
-                if recv.capacity() < 256 * 1024 {
-                    let cap = (recv.capacity() * 2).min(256 * 1024);
-                    recv = BytesMut::with_capacity(cap);
-                    continue;
-                }
+            if n == recv.capacity() && n < 256 * 1024 && n > 0 {
+                let cap = (recv.capacity() * 2).min(256 * 1024);
+                recv = BytesMut::with_capacity(cap);
+                continue;
             }
             if n == 0 {
                 break;
@@ -810,6 +870,34 @@ impl NlSession {
         }
         Ok(())
     }
+
+    /// Query set flags for `(family, table, set)` using this session
+    /// (avoids opening a separate socket for the flags query).
+    /// Returns `NFTA_SET_FLAGS` as a `u32` (host order), `0` if absent.
+    async fn query_flags(&self, family: u8, table: &str, set: &str) -> io::Result<u32> {
+        const FLAGS: u16 = NLM_F_REQUEST | NLM_F_ACK;
+        let nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETSET;
+
+        let mut buf = MsgBuf::new();
+        let head = buf.put_header();
+        buf.put_attr_stringz(NFTA_SET_TABLE, table);
+        buf.put_attr_stringz(NFTA_SET_NAME, set);
+        buf.set_header(head, nlmsg_type, family, 0, FLAGS, 0);
+
+        buf.fix_seq_at(0, self.seq);
+        self.send(&buf).await?;
+
+        let mut flags: u32 = 0;
+        self.recv_each(false, |_resp_type, body| {
+            for a in iter_attrs(&body[NFG_HDRLEN..]) {
+                if a.attr_type() == NFTA_SET_FLAGS {
+                    flags = a.as_u32_be();
+                }
+            }
+            Ok(())
+        }).await?;
+        Ok(flags)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,35 +910,8 @@ impl NlSession {
 /// netlink request itself fails or the kernel rejects it (e.g. ENOENT).
 #[cfg(target_os = "linux")]
 pub async fn dump_set_flags(family: u8, table: &str, set: &str) -> io::Result<u32> {
-    // Non-dump single-set GET: NLM_F_REQUEST | NLM_F_ACK only (no
-    // NLM_F_DUMP, which would list every set in this family).  The kernel
-    // replies with one NFT_MSG_NEWSET message carrying this set's
-    // metadata including NFTA_SET_FLAGS.
-    const FLAGS: u16 = NLM_F_REQUEST | NLM_F_ACK;
-    let nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETSET;
-
-    let mut buf = MsgBuf::new();
-    let head = buf.put_header();
-    buf.put_attr_stringz(NFTA_SET_TABLE, table);
-    buf.put_attr_stringz(NFTA_SET_NAME, set);
-    buf.set_header(head, nlmsg_type, family, 0, FLAGS, 0);
-
     let sess = NlSession::open().await?;
-    buf.fix_seq_at(0, sess.seq);
-    sess.send(&buf).await?;
-
-    let mut flags: u32 = 0;
-    sess.recv_each(false, |_resp_type, body| {
-        // body = nfgenmsg + NFTA_SET_* TLVs; attrs start after the 4-byte
-        // nfgenmsg header.
-        for a in iter_attrs(&body[NFG_HDRLEN..]) {
-            if a.attr_type() == NFTA_SET_FLAGS {
-                flags = a.as_u32_be();
-            }
-        }
-        Ok(())
-    }).await?;
-    Ok(flags)
+    sess.query_flags(family, table, set).await
 }
 
 #[cfg(target_os = "linux")]
@@ -920,16 +981,11 @@ pub async fn add_set_element(
     timeout_ms: Option<u64>,
     excl: bool,
 ) -> io::Result<()> {
+    // Open one session and reuse it for both the flags query and the batch write.
+    let mut sess = NlSession::open().await?;
+
     // Detect whether the target set is an interval set.
-    let is_interval = match dump_set_flags(family, table, set).await {
-        Ok(f) => (f & NFT_SET_INTERVAL) != 0,
-        Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("cannot query set flags: {e}"),
-            ));
-        }
-    };
+    let is_interval = (sess.query_flags(family, table, set).await? & NFT_SET_INTERVAL) != 0;
 
     let nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM;
     let mut extra = NLM_F_CREATE;
@@ -937,7 +993,8 @@ pub async fn add_set_element(
     let flags = NLM_F_REQUEST | extra | NLM_F_ACK;
 
     let mut buf = MsgBuf::new();
-    let base_seq = std::process::id();
+    let base_seq = sess.seq;
+    let elem_seq = base_seq.wrapping_add(1);
 
     // ── BATCH_BEGIN ──
     let begin_off = buf.put_header();
@@ -992,7 +1049,6 @@ pub async fn add_set_element(
 
     buf.close_nest(nest_list);
 
-    let elem_seq = base_seq + 1;
     buf.set_header(elem_off, nlmsg_type, family, elem_seq, flags, 0);
 
     // ── BATCH_END ──
@@ -1003,7 +1059,6 @@ pub async fn add_set_element(
     );
 
     // ── Transport ──
-    let mut sess = NlSession::open().await?;
     sess.seq = elem_seq;
     buf.fix_seq_at(elem_off, elem_seq);
     sess.send(&buf).await?;
@@ -1039,22 +1094,18 @@ pub async fn delete_set_element(
     key: &[u8],
     key_end: Option<&[u8]>,   // inclusive upper bound (e.g. broadcast)
 ) -> io::Result<()> {
+    // Open one session and reuse it for both the flags query and the batch write.
+    let mut sess = NlSession::open().await?;
+
     // Detect whether the target set is an interval set.
-    let is_interval = match dump_set_flags(family, table, set).await {
-        Ok(f) => (f & NFT_SET_INTERVAL) != 0,
-        Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("cannot query set flags: {e}"),
-            ));
-        }
-    };
+    let is_interval = (sess.query_flags(family, table, set).await? & NFT_SET_INTERVAL) != 0;
 
     let nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_DELSETELEM;
     let flags = NLM_F_REQUEST | NLM_F_ACK;
 
     let mut buf = MsgBuf::new();
-    let base_seq = std::process::id();
+    let base_seq = sess.seq;
+    let elem_seq = base_seq.wrapping_add(1);
 
     // ── BATCH_BEGIN ──
     let begin_off = buf.put_header();
@@ -1104,7 +1155,6 @@ pub async fn delete_set_element(
 
     buf.close_nest(nest_list);
 
-    let elem_seq = base_seq + 1;
     buf.set_header(elem_off, nlmsg_type, family, elem_seq, flags, 0);
 
     // ── BATCH_END ──
@@ -1115,7 +1165,6 @@ pub async fn delete_set_element(
     );
 
     // ── Transport ──
-    let mut sess = NlSession::open().await?;
     sess.seq = elem_seq;
     buf.fix_seq_at(elem_off, elem_seq);
     sess.send(&buf).await?;
@@ -1136,7 +1185,6 @@ pub async fn delete_set_element(
 /// (e.g. from a prior `dump_set_elements`), call [`set_contains_ip`] directly
 /// to avoid the extra `NFT_MSG_GETSET` round trip.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub async fn set_contains_ip_async(
     family: u8,
     table: &str,
@@ -1166,7 +1214,7 @@ pub async fn set_contains_ip_async(
 /// expands into (start, end-marker) pairs via `increment_be`, mirroring
 /// what `nft` would send for a standalone add / delete.
 #[cfg(target_os = "linux")]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn batch_add_and_delete_set_element(
     family: u8,
     table: &str,
@@ -1180,16 +1228,11 @@ pub async fn batch_add_and_delete_set_element(
     add_timeout_ms: Option<u64>,
     add_excl: bool,
 ) -> io::Result<()> {
+    // Open one session and reuse it for both the flags query and the batch write.
+    let mut sess = NlSession::open().await?;
+
     // One flags query for both operations.
-    let is_interval = match dump_set_flags(family, table, set).await {
-        Ok(f) => (f & NFT_SET_INTERVAL) != 0,
-        Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("cannot query set flags: {e}"),
-            ));
-        }
-    };
+    let is_interval = (sess.query_flags(family, table, set).await? & NFT_SET_INTERVAL) != 0;
 
     let del_nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_DELSETELEM;
     let add_nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM;
@@ -1197,9 +1240,9 @@ pub async fn batch_add_and_delete_set_element(
     if add_excl { add_extra |= NLM_F_EXCL; }
 
     let mut buf = MsgBuf::new();
-    let base_seq = std::process::id();
-    let del_seq = base_seq + 1;
-    let add_seq = base_seq + 2;
+    let base_seq = sess.seq;
+    let del_seq = base_seq.wrapping_add(1);
+    let add_seq = base_seq.wrapping_add(2);
 
     // ── BATCH_BEGIN ──
     {
@@ -1216,7 +1259,7 @@ pub async fn batch_add_and_delete_set_element(
     buf.put_attr_stringz(NFTA_SET_ELEM_LIST_SET, set);
     {
         let nest_list = buf.open_nest(NFTA_SET_ELEM_LIST_ELEMENTS);
-        put_elem_into_list(&mut buf, is_interval, del_key, del_key_end, None);
+        put_elem_into_list(&mut buf, is_interval, del_key, del_key_end, None)?;
         buf.close_nest(nest_list);
     }
     buf.set_header(del_off, del_nlmsg_type, family, del_seq, NLM_F_REQUEST | NLM_F_ACK, 0);
@@ -1227,7 +1270,7 @@ pub async fn batch_add_and_delete_set_element(
     buf.put_attr_stringz(NFTA_SET_ELEM_LIST_SET, set);
     {
         let nest_list = buf.open_nest(NFTA_SET_ELEM_LIST_ELEMENTS);
-        put_elem_into_list(&mut buf, is_interval, add_key, add_key_end, add_timeout_ms);
+        put_elem_into_list(&mut buf, is_interval, add_key, add_key_end, add_timeout_ms)?;
         buf.close_nest(nest_list);
     }
     buf.set_header(add_off, add_nlmsg_type, family, add_seq, NLM_F_REQUEST | add_extra | NLM_F_ACK, 0);
@@ -1242,7 +1285,6 @@ pub async fn batch_add_and_delete_set_element(
     }
 
     // ── Transport ──
-    let mut sess = NlSession::open().await?;
     sess.seq = del_seq;  // accepted alongside add_seq by recv_for_seqs
     buf.fix_seq_at(del_off, del_seq);
     buf.fix_seq_at(add_off, add_seq);
@@ -1254,6 +1296,7 @@ pub async fn batch_add_and_delete_set_element(
 
 /// Helper to serialise one element (or start+end pair for interval sets)
 /// into the currently-open `NFTA_SET_ELEM_LIST_ELEMENTS` nest.
+/// Returns an error if the element interval overflows (all-0xFF bytes).
 #[cfg(target_os = "linux")]
 fn put_elem_into_list(
     buf: &mut MsgBuf,
@@ -1261,7 +1304,7 @@ fn put_elem_into_list(
     key: &[u8],
     key_end: Option<&[u8]>,
     timeout_ms: Option<u64>,
-) {
+) -> io::Result<()> {
     let mut put_one = |k: &[u8], iend: bool, tmo: Option<u64>| {
         let ne = buf.open_nest(NFTA_LIST_ELEM);
         let nk = buf.open_nest(NFTA_SET_ELEM_KEY);
@@ -1286,12 +1329,16 @@ fn put_elem_into_list(
             Some(ke) => ke.to_vec(),
             None => key.to_vec(),
         };
-        if increment_be(&mut end_key).is_some() {
-            put_one(&end_key, true, None);
-        } // else: overflow — silently skip end marker (kernel will reject anyway)
+        if increment_be(&mut end_key).is_none() {
+            return Err(io::Error::other(
+                "element interval overflows (all-0xFF bytes)",
+            ));
+        }
+        put_one(&end_key, true, None);
     } else {
         put_one(key, false, timeout_ms);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,16 +1379,11 @@ pub async fn batch_add_set_elements(
     elements: &[AddElem<'_>],
     excl: bool,
 ) -> io::Result<()> {
+    // Open one session and reuse it for both the flags query and the batch write.
+    let sess = NlSession::open().await?;
+
     // One flags query for the whole batch.
-    let is_interval = match dump_set_flags(family, table, set).await {
-        Ok(f) => (f & NFT_SET_INTERVAL) != 0,
-        Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("cannot query set flags: {e}"),
-            ));
-        }
-    };
+    let is_interval = (sess.query_flags(family, table, set).await? & NFT_SET_INTERVAL) != 0;
 
     let nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM;
     let mut extra = NLM_F_CREATE;
@@ -1349,7 +1391,7 @@ pub async fn batch_add_set_elements(
     let flags = NLM_F_REQUEST | extra | NLM_F_ACK;
 
     let mut buf = MsgBuf::new();
-    let base_seq = std::process::id();
+    let base_seq = sess.seq;
 
     // ── BATCH_BEGIN ──
     {
@@ -1362,7 +1404,7 @@ pub async fn batch_add_set_elements(
 
     // ── one NEWSETELEM per element ──
     let elem_seqs: Vec<u32> = (0..elements.len() as u32)
-        .map(|i| base_seq + 1 + i)
+        .map(|i| base_seq.wrapping_add(1 + i))
         .collect();
     let mut elem_offs: Vec<usize> = Vec::with_capacity(elements.len());
 
@@ -1373,7 +1415,7 @@ pub async fn batch_add_set_elements(
 
         {
             let nest_list = buf.open_nest(NFTA_SET_ELEM_LIST_ELEMENTS);
-            put_elem_into_list(&mut buf, is_interval, elem.key, elem.key_end, elem.timeout_ms);
+            put_elem_into_list(&mut buf, is_interval, elem.key, elem.key_end, elem.timeout_ms)?;
             buf.close_nest(nest_list);
         }
 
@@ -1386,12 +1428,11 @@ pub async fn batch_add_set_elements(
         let off = buf.put_header();
         buf.set_header(
             off, NFNL_MSG_BATCH_END, AF_UNSPEC,
-            base_seq + elements.len() as u32 + 1, NLM_F_REQUEST, NFNL_SUBSYS_NFTABLES,
+            base_seq.wrapping_add(elements.len() as u32 + 1), NLM_F_REQUEST, NFNL_SUBSYS_NFTABLES,
         );
     }
 
     // ── Transport ──
-    let sess = NlSession::open().await?;
     for (&off, &seq) in elem_offs.iter().zip(elem_seqs.iter()) {
         buf.fix_seq_at(off, seq);
     }
@@ -1411,7 +1452,7 @@ pub async fn batch_add_set_elements(
 pub async fn dump_set_flags(_family: u8, _table: &str, _set: &str) -> io::Result<u32> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "nfnetlink set dump is only supported on Linux",
+        "nfnetlink operations require Linux; this binary was compiled on a non-Linux target",
     ))
 }
 
@@ -1419,7 +1460,7 @@ pub async fn dump_set_flags(_family: u8, _table: &str, _set: &str) -> io::Result
 pub async fn dump_set_elements(_family: u8, _table: &str, _set: &str) -> io::Result<Vec<Elem>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "nfnetlink set dump is only supported on Linux",
+        "nfnetlink operations require Linux; this binary was compiled on a non-Linux target",
     ))
 }
 
@@ -1435,7 +1476,7 @@ pub async fn add_set_element(
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "nfnetlink add element is only supported on Linux",
+        "nfnetlink operations require Linux; this binary was compiled on a non-Linux target",
     ))
 }
 
@@ -1449,7 +1490,7 @@ pub async fn delete_set_element(
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "nfnetlink delete element is only supported on Linux",
+        "nfnetlink operations require Linux; this binary was compiled on a non-Linux target",
     ))
 }
 
@@ -1468,7 +1509,7 @@ pub async fn batch_add_and_delete_set_element(
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "nfnetlink batch add+delete is only supported on Linux",
+        "nfnetlink operations require Linux; this binary was compiled on a non-Linux target",
     ))
 }
 
@@ -1482,12 +1523,11 @@ pub async fn batch_add_set_elements(
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "nfnetlink batch-add elements is only supported on Linux",
+        "nfnetlink operations require Linux; this binary was compiled on a non-Linux target",
     ))
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub async fn set_contains_ip_async(
     _family: u8,
     _table: &str,
@@ -1496,7 +1536,7 @@ pub async fn set_contains_ip_async(
 ) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "set membership check is only supported on Linux",
+        "nfnetlink set membership check is only supported on Linux",
     ))
 }
 
@@ -1586,15 +1626,150 @@ mod tests {
     #[test]
     fn decrement_be_handles_borrow() {
         let mut b = vec![0u8, 0, 5];
-        decrement_be(&mut b);
+        assert!(decrement_be(&mut b).is_some());
         assert_eq!(b, vec![0u8, 0, 4]);
         let mut c = vec![1u8, 0, 0];
-        decrement_be(&mut c);
+        assert!(decrement_be(&mut c).is_some());
         assert_eq!(c, vec![0u8, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn decrement_be_underflow_returns_none() {
         let mut d = vec![0u8; 4];
-        decrement_be(&mut d);
-        // 0 underflows — interval set never legitimately does this, but
-        // the function shouldn't panic; the result is the saturated 0xff..f.
-        assert_eq!(d, vec![0xff, 0xff, 0xff, 0xff]);
+        assert!(decrement_be(&mut d).is_none());
+        // On underflow the buffer is unchanged (all zeros).
+        assert_eq!(d, vec![0u8, 0, 0, 0]);
+        // Single zero byte also underflows.
+        let mut e = vec![0u8];
+        assert!(decrement_be(&mut e).is_none());
+    }
+
+    #[test]
+    fn decrement_be_empty_returns_none() {
+        let mut empty: Vec<u8> = vec![];
+        assert!(decrement_be(&mut empty).is_none());
+    }
+
+    #[test]
+    fn set_contains_ip_non_interval_exact_match() {
+        let elems = vec![
+            single(&[192, 168, 1, 1], None, None),
+            single(&[10, 0, 0, 1], None, None),
+        ];
+        assert!(set_contains_ip(&elems, false, &[192, 168, 1, 1]));
+        assert!(set_contains_ip(&elems, false, &[10, 0, 0, 1]));
+        assert!(!set_contains_ip(&elems, false, &[192, 168, 1, 2]));
+        assert!(!set_contains_ip(&elems, false, &[10, 0, 0, 0]));
+    }
+
+    #[test]
+    fn set_contains_ip_interval_range() {
+        // Interval set: 10.0.0.0/24 as a raw start/end pair.
+        let raw = vec![
+            single(&[10, 0, 0, 0], None, None),
+            end(&[10, 0, 1, 0]),    // exclusive end = 10.0.1.0
+        ];
+        assert!(set_contains_ip(&raw, true, &[10, 0, 0, 0]));   // network
+        assert!(set_contains_ip(&raw, true, &[10, 0, 0, 1]));   // inside
+        assert!(set_contains_ip(&raw, true, &[10, 0, 0, 255])); // broadcast
+        assert!(!set_contains_ip(&raw, true, &[10, 0, 1, 0]));  // exclusive end
+        assert!(!set_contains_ip(&raw, true, &[10, 0, 1, 1]));  // outside
+        assert!(!set_contains_ip(&raw, true, &[9, 255, 255, 255])); // below
+    }
+
+    #[test]
+    fn set_contains_ip_interval_single_address() {
+        // Single address in an interval set: start == end.
+        let raw = vec![
+            single(&[1, 2, 3, 4], None, None),
+            end(&[1, 2, 3, 5]),     // exclusive end = 1.2.3.5
+        ];
+        assert!(set_contains_ip(&raw, true, &[1, 2, 3, 4]));
+        assert!(!set_contains_ip(&raw, true, &[1, 2, 3, 5]));
+        assert!(!set_contains_ip(&raw, true, &[1, 2, 3, 3]));
+    }
+
+    #[test]
+    fn set_contains_ip_interval_with_orphan_end() {
+        // Orphan end marker at the front (e.g. the 0.0.0.0 tidy marker)
+        // must be ignored; the only real element is 10.0.0.0/24.
+        let raw = vec![
+            end(&[0, 0, 0, 0]),
+            single(&[10, 0, 0, 0], None, None),
+            end(&[10, 0, 1, 0]),
+        ];
+        assert!(set_contains_ip(&raw, true, &[10, 0, 0, 1]));
+        assert!(set_contains_ip(&raw, true, &[10, 0, 0, 255]));
+        assert!(!set_contains_ip(&raw, true, &[0, 0, 0, 0]));
+        assert!(!set_contains_ip(&raw, true, &[10, 0, 1, 0]));
+    }
+
+    #[test]
+    fn set_contains_ip_interval_key_end_form() {
+        // Element with KEY + KEY_END (single-element form).
+        // The kernel stores `key_end` as the **exclusive** upper bound,
+        // so for a 192.168.0.0/24 range the exclusive end is 192.168.1.0.
+        let raw = vec![
+            Elem {
+                key: vec![192, 168, 0, 0],
+                is_end: false,
+                key_end: vec![192, 168, 1, 0],  // exclusive upper bound
+                timeout_ms: None,
+                expiration_ms: None,
+            },
+        ];
+        assert!(set_contains_ip(&raw, true, &[192, 168, 0, 0]));
+        assert!(set_contains_ip(&raw, true, &[192, 168, 0, 100]));
+        assert!(set_contains_ip(&raw, true, &[192, 168, 0, 255]));
+        assert!(!set_contains_ip(&raw, true, &[192, 168, 1, 0]));
+        assert!(!set_contains_ip(&raw, true, &[192, 168, 1, 1]));
+    }
+
+    /// Reproduce the reported bug: 3.5.64.0/18 showing as bare "3.5.64.0"
+    /// because NFTA_SET_ELEM_KEY_END constant was wrong (10 instead of 9).
+    /// Both the start/end-marker pair form and the single-element KEY_END
+    /// form must produce a paired Elem with key_end = 3.5.127.255.
+    #[test]
+    fn interval_set_3_5_64_0_18_properly_paired() {
+        // ── Boundary-pair form ──
+        let raw = vec![
+            single(&[3, 5, 64, 0], None, None),
+            end(&[3, 5, 128, 0]),   // exclusive end
+        ];
+        let out = reduce_intervals(raw, true);
+        assert_eq!(out.len(), 1, "expected 1 paired element");
+        assert_eq!(&out[0].key, &k(&[3, 5, 64, 0]));
+        assert_eq!(&out[0].key_end, &k(&[3, 5, 127, 255]));
+
+        // ── Single-element KEY_END form ──
+        let raw = vec![
+            Elem {
+                key: vec![3, 5, 64, 0],
+                is_end: false,
+                key_end: vec![3, 5, 128, 0],
+                timeout_ms: None,
+                expiration_ms: None,
+            },
+        ];
+        let out = reduce_intervals(raw, true);
+        assert_eq!(out.len(), 1, "expected 1 paired element from KEY_END form");
+        assert_eq!(&out[0].key, &k(&[3, 5, 64, 0]));
+        assert_eq!(&out[0].key_end, &k(&[3, 5, 127, 255]));
+    }
+
+    #[test]
+    fn increment_be_works_correctly() {
+        let mut b = vec![0u8; 4];
+        assert!(increment_be(&mut b).is_some());
+        assert_eq!(b, vec![0, 0, 0, 1]);
+
+        let mut all_ff = vec![0xffu8; 4];
+        assert!(increment_be(&mut all_ff).is_none());
+        // On overflow the buffer is unchanged.
+        assert_eq!(all_ff, vec![0xff, 0xff, 0xff, 0xff]);
+
+        let mut carry = vec![0u8, 0, 0xff];
+        assert!(increment_be(&mut carry).is_some());
+        assert_eq!(carry, vec![0, 1, 0]);
     }
 }

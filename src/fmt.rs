@@ -109,7 +109,7 @@ fn hex(b: &[u8]) -> String {
 /// Returns `Some((network_bytes, prefix_len, bits))` when a clean CIDR block
 /// is recovered; `None` otherwise (caller falls back to start-end):
 /// matches nftables' `interval_to_prefix` vs `interval_to_range` switch.
-fn interval_to_cidr(low: &[u8], high: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+pub fn interval_to_cidr(low: &[u8], high: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     if low.is_empty() || low.len() != high.len() { return None; }
     let bytes = low.len();
     let bits  = (bytes as u32) * 8;
@@ -297,6 +297,7 @@ mod tests {
         be_int, format_addr, format_duration, interval_to_cidr, parse_addr,
         parse_duration, parse_element, range_is_prefix,
     };
+    use crate::nl::Elem;
 
     #[test]
     fn range_is_prefix_matches_iff_host_mask_is_contiguous_low_bits() {
@@ -429,5 +430,56 @@ mod tests {
 
         assert!(parse_element("bogus/24").is_none());
         assert!(parse_element("1.2.3.4/33").is_none());
+    }
+
+    #[test]
+    fn format_element_3_5_64_0_18_shows_mask() {
+        // After reduce_intervals, an element for 3.5.64.0/18 should have
+        // key = 3.5.64.0 and key_end = 3.5.127.255 (inclusive).
+        let e = Elem {
+            key: vec![3, 5, 64, 0],
+            is_end: false,
+            key_end: vec![3, 5, 127, 255],
+            timeout_ms: None,
+            expiration_ms: None,
+        };
+        assert_eq!(super::format_element(&e), "3.5.64.0/18");
+    }
+
+    #[test]
+    fn format_element_single_ip_no_mask() {
+        let e = Elem {
+            key: vec![10, 0, 0, 1],
+            is_end: false,
+            key_end: vec![],
+            timeout_ms: None,
+            expiration_ms: None,
+        };
+        assert_eq!(super::format_element(&e), "10.0.0.1");
+    }
+
+    #[test]
+    fn format_element_with_timeout() {
+        let e = Elem {
+            key: vec![192, 168, 1, 1],
+            is_end: false,
+            key_end: vec![],
+            timeout_ms: Some(3_600_000),
+            expiration_ms: None,
+        };
+        assert_eq!(super::format_element(&e), "192.168.1.1 timeout 1h");
+    }
+
+    #[test]
+    fn format_element_range_fallback() {
+        // A range that can't collapse to CIDR (misaligned) shows start-end.
+        let e = Elem {
+            key: vec![10, 0, 0, 5],
+            is_end: false,
+            key_end: vec![10, 0, 0, 10],
+            timeout_ms: None,
+            expiration_ms: None,
+        };
+        assert_eq!(super::format_element(&e), "10.0.0.5-10.0.0.10");
     }
 }
