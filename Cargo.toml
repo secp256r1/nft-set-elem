@@ -1,0 +1,21 @@
+[package]
+name = "nft-set-elem"
+version = "0.1.0"
+edition = "2024"
+description = "List, add, delete, and replace nftables set elements over nfnetlink without libnftnl/libmnl"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-sys = { version = "0.8", features = ["tokio_socket"] }
+bytes = "1"
+
+[profile.release]
+opt-level = 2
+
+[[bin]]
+name = "nftse"
+path = "src/bin/nft-set-elem.rs"
