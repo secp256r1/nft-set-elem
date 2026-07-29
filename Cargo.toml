@@ -6,12 +6,12 @@ description = "List, add, delete, and replace nftables set elements over nfnetli
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1.53.1", features = ["rt", "time", "macros"] }
+tokio = { version = "1.53.1", features = ["rt", "time", "macros"], optional = true }
 clap = { version = "4.6.4", features = ["derive"], optional = true }
 
 [features]
 default = []
-cli = ["dep:clap"]
+cli = ["dep:clap", "dep:tokio"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-sys = { version = "0.8", features = ["tokio_socket"] }
